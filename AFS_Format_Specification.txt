@@ -1,0 +1,652 @@
+
+================================================================================
+                        AFS (Archive File System) 格式详解
+                        基于 MaikelChan/AFSLib v2.x 源码分析
+================================================================================
+
+AFS 是世嘉（Sega）在 Dreamcast / PS2 / PSP / Xbox 等平台广泛使用的归档格式。
+它本质上是一个简单的"文件系统模拟器"，把多个文件打包成一个二进制容器。
+
+================================================================================
+一、核心常量定义
+================================================================================
+
+常量名                          值(hex)     值(dec)     说明
+────────────────────────────────────────────────────────────────────────────────
+HEADER_MAGIC_00                 0x00534641  5453377     魔数 "AFS\0" (小端序)
+HEADER_MAGIC_20                 0x20534641  543238977   魔数 "AFS " (空格结尾)
+HEADER_SIZE                     0x8         8           头部大小
+ENTRY_INFO_ELEMENT_SIZE         0x8         8           每个目录条目大小
+ATTRIBUTE_INFO_SIZE             0x8         8           属性信息块大小
+ATTRIBUTE_ELEMENT_SIZE          0x30        48          每个属性条目大小
+MAX_ENTRY_NAME_LENGTH           0x20        32          文件名最大长度
+MIN_ENTRY_BLOCK_ALIGNMENT_SIZE  0x800       2048        最小数据块对齐
+ALIGNMENT_SIZE                  0x800       2048        默认对齐粒度
+
+================================================================================
+二、文件整体结构
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  头部 (Header)                                                              │
+│  ├─ offset 0x00: magic          uint32_t   4 bytes   魔数 "AFS\0"          │
+│  └─ offset 0x04: entryCount     uint32_t   4 bytes   文件数量              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  目录区 (Entry Info Block)                                                  │
+│  ├─ EntryInfo[0]                8 bytes    文件0的偏移+大小                 │
+│  ├─ EntryInfo[1]                8 bytes    文件1的偏移+大小                 │
+│  ├─ ...                                                                     │
+│  └─ EntryInfo[entryCount-1]     8 bytes    最后一个文件的偏移+大小          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  [可选] 属性信息 (Attribute Info) — 仅在 AttributesInfoType 不为 NoAttributes │
+│  ├─ attributesOffset            uint32_t   4 bytes   属性表偏移             │
+│  └─ attributesSize              uint32_t   4 bytes   属性表总大小           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  填充区 (Padding)                                                           │
+│  └─ 0x00 填充至 EntryBlockAlignment 对齐边界 (默认 2048)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  文件数据区 (Entry Data Block)                                              │
+│  ├─ 文件0数据                   variable   实际文件内容                     │
+│  ├─ 填充至 2048 对齐                                                        │
+│  ├─ 文件1数据                   variable   实际文件内容                     │
+│  ├─ 填充至 2048 对齐                                                        │
+│  ├─ ...                                                                     │
+│  └─ 最后一个文件数据 + 填充                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  [可选] 属性表 (Attribute Table)                                            │
+│  ├─ Attribute[0]                48 bytes   文件0的属性(文件名+时间+自定义)  │
+│  ├─ Attribute[1]                48 bytes   文件1的属性                      │
+│  ├─ ...                                                                     │
+│  └─ Attribute[entryCount-1]     48 bytes   最后一个文件的属性               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  尾部填充 (End Padding)                                                     │
+│  └─ 0x00 填充至 2048 对齐边界                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+三、数据结构详解
+================================================================================
+
+【3.1 头部 (Header)】
+
+offset 0x00:
+  uint32_t magic
+
+  取值:
+    0x00534641 = "AFS\0" (小端序字节: 41 46 53 00)
+    0x20534641 = "AFS " (小端序字节: 41 46 53 20)
+
+  注意: 小端序存储，读取时不要按字符串比较，要按 uint32 比较。
+
+offset 0x04:
+  uint32_t entryCount
+
+  文件中包含的条目数量。每个条目对应一个文件或一个空槽位。
+
+────────────────────────────────────────────────────────────────────────────────
+
+【3.2 目录条目 (EntryInfo)】
+
+每个条目 8 字节:
+
+offset 0x00 (相对条目起始):
+  uint32_t offset
+
+  文件数据在 AFS 中的绝对偏移地址。
+  如果 offset == 0，表示这是一个 NullEntry（空条目）。
+
+offset 0x04 (相对条目起始):
+  uint32_t size
+
+  文件的实际大小（字节数）。
+  如果 size == 0，也表示这是一个 NullEntry。
+
+目录条目数组从 offset 0x08 开始，连续排列 entryCount 个。
+
+────────────────────────────────────────────────────────────────────────────────
+
+【3.3 属性信息 (AttributeInfo)】
+
+位置取决于 AttributesInfoType:
+
+类型 InfoAtBeginning:
+  紧跟在目录条目数组之后，offset = 0x08 + entryCount * 8
+
+类型 InfoAtEnd:
+  在第一个文件数据块之前，offset = firstEntryOffset - 8
+
+类型 NoAttributes:
+  不存在
+
+结构:
+  uint32_t attributesOffset   ← 属性表的起始偏移
+  uint32_t attributesSize     ← 属性表的总大小 (应为 entryCount * 48)
+
+────────────────────────────────────────────────────────────────────────────────
+
+【3.4 属性条目 (Attribute)】
+
+每个属性条目固定 48 字节 (0x30):
+
+offset 0x00:
+  char name[32]               ← 文件名，以 \0 结尾，不足 32 字节用 \0 填充
+
+offset 0x20:
+  uint16_t year               ← 文件修改时间: 年
+  uint16_t month              ← 文件修改时间: 月 (1-12)
+  uint16_t day                ← 文件修改时间: 日 (1-31)
+  uint16_t hour               ← 文件修改时间: 时 (0-23)
+  uint16_t minute             ← 文件修改时间: 分 (0-59)
+  uint16_t second             ← 文件修改时间: 秒 (0-59)
+
+offset 0x2C:
+  uint32_t customData         ← 自定义数据，通常 = 文件大小 (与 EntryInfo.size 相同)
+
+注意: 时间字段每个都是 uint16_t (2字节)，共 12 字节。
+      但源码中写入时每个字段单独写，不是结构体打包。
+
+================================================================================
+四、对齐计算详解
+================================================================================
+
+【4.1 第一个文件数据块的偏移计算】
+
+公式:
+  firstEntryOffset = Pad(HEADER_SIZE + entryCount * ENTRY_INFO_ELEMENT_SIZE + ATTRIBUTE_INFO_SIZE, EntryBlockAlignment)
+
+其中 Pad(value, alignment) 函数:
+  如果 value 已经是 alignment 的倍数: 返回 value
+  否则: 返回 value + (alignment - value % alignment)
+
+示例 (entryCount = 3, EntryBlockAlignment = 2048):
+  头部 + 目录 + 属性信息 = 8 + 3*8 + 8 = 40 字节
+  Pad(40, 2048) = 2048
+  → 第一个文件数据从 offset 2048 开始
+
+────────────────────────────────────────────────────────────────────────────────
+
+【4.2 文件数据之间的对齐】
+
+每个文件数据写入后，下一个文件的起始位置:
+  nextEntryOffset = Pad(currentOffset + fileSize, ALIGNMENT_SIZE)
+
+其中 ALIGNMENT_SIZE 固定为 2048。
+
+示例:
+  文件0: offset=2048, size=1234
+  文件0结束: 2048 + 1234 = 3282
+  Pad(3282, 2048) = 4096
+  → 文件1从 offset 4096 开始
+
+  文件0和文件1之间有 4096 - 3282 = 814 字节的填充 (0x00)
+
+────────────────────────────────────────────────────────────────────────────────
+
+【4.3 文件末尾的对齐】
+
+整个 AFS 文件最后也按 2048 对齐:
+  endOfFile = Pad(currentPosition, ALIGNMENT_SIZE)
+
+如果写入后文件大小不是 2048 的倍数，尾部用 0x00 填充。
+
+================================================================================
+五、属性信息位置检测算法
+================================================================================
+
+AFSLib 加载 AFS 时，需要判断属性信息是否存在，以及在哪里。
+
+【5.1 检测流程】
+
+步骤1: 在目录条目数组后读取 8 字节
+  offset = 0x08 + entryCount * 8
+  读取 attributesOffset (uint32) 和 attributesSize (uint32)
+
+步骤2: 验证 (IsAttributeInfoValid)
+  条件:
+    a) attributesOffset != 0
+    b) attributesSize != 0
+    c) attributesSize <= afsFileSize - dataBlockEndOffset
+       (属性表大小不能超过文件末尾剩余空间)
+    d) attributesSize >= entryCount * 48
+       (属性表至少能容纳所有条目的属性)
+    e) attributesOffset >= dataBlockEndOffset
+       (属性表不能在数据块之前)
+    f) attributesOffset <= afsFileSize - attributesSize
+       (属性表不能超出文件边界)
+
+  如果全部满足 → AttributesInfoType = InfoAtBeginning
+
+步骤3: 如果步骤2验证失败
+  跳到 entryBlockStartOffset - 8 处
+  重新读取 attributesOffset 和 attributesSize
+  再次验证
+
+  如果满足 → AttributesInfoType = InfoAtEnd
+
+步骤4: 如果都失败
+  AttributesInfoType = NoAttributes
+  所有文件名自动命名为 "00000000", "00000001" 等
+
+【5.2 为什么需要这个复杂的检测？】
+
+因为不同游戏的 AFS 格式变体不同:
+  - 有些游戏把属性信息放在目录后 (InfoAtBeginning)
+  - 有些游戏把属性信息放在数据块前 (InfoAtEnd)
+  - 有些游戏完全没有属性信息 (NoAttributes)
+  - 有些游戏在 InfoAtBeginning 的位置放的是垃圾数据，真正的属性信息在 InfoAtEnd
+
+AFSLib 通过验证算法自动判断正确的格式。
+
+================================================================================
+六、EntryBlockAlignment 详解
+================================================================================
+
+【6.1 什么是 EntryBlockAlignment？】
+
+EntryBlockAlignment 决定了第一个文件数据块从哪里开始。
+它通常等于 2048 (0x800)，但有些游戏使用更大的值 (如 4096, 8192 等)。
+
+【6.2 为什么需要 EntryBlockAlignment？】
+
+AFS 最初是为光盘 (CD/DVD) 设计的。光盘的最小读取单元是 2048 字节 (一个扇区)。
+把文件数据对齐到扇区边界可以提高读取性能。
+
+【6.3 AFSLib 如何计算 EntryBlockAlignment？】
+
+加载 AFS 时:
+  alignment = 2048
+  endInfoBlock = 当前流位置 + 8 (属性信息大小)
+  while (endInfoBlock + alignment < entryBlockStartOffset):
+      alignment <<= 1  (alignment *= 2)
+
+  EntryBlockAlignment = alignment
+
+这意味着:
+  - 如果 entryBlockStartOffset 是 2048 的倍数但不是 4096 的倍数 → alignment = 2048
+  - 如果 entryBlockStartOffset 是 4096 的倍数但不是 8192 的倍数 → alignment = 4096
+  - 以此类推
+
+【6.4 创建 AFS 时的 EntryBlockAlignment】
+
+创建时默认使用 2048。如果需要匹配特定游戏的格式，
+可以从原始 AFS 读取 EntryBlockAlignment，然后设置到新 AFS:
+
+  afs.EntryBlockAlignment = originalAfs.EntryBlockAlignment;
+
+================================================================================
+七、NullEntry 详解
+================================================================================
+
+【7.1 什么是 NullEntry？】
+
+NullEntry 是一个特殊的空槽位，表示该位置没有文件。
+
+在 EntryInfo 中:
+  offset == 0 且 size == 0 → NullEntry
+
+【7.2 为什么需要 NullEntry？】
+
+某些游戏的 AFS 中会有"空洞"，即某些索引位置没有文件。
+这可能是为了:
+  - 保留索引号给未来扩展
+  - 删除文件后不重新打包整个 AFS
+  - 对齐或格式要求
+
+【7.3 AFSLib 如何处理 NullEntry？】
+
+提取时:
+  - 跳过 NullEntry，不生成文件
+
+创建时:
+  - 可以调用 AddNullEntry() 添加空槽位
+  - SaveToStream 时写入 offset=0, size=0
+  - 不写入文件数据
+  - 属性表中跳过 (Position += 48)
+
+【7.4 AFSPacker v2.1.2 修复的 NullEntry Bug】
+
+旧版本 (v2.1.0 及之前) 有一个 bug:
+  - 如果目录中的文件是 0 字节，会被误判为 NullEntry
+  - 导致写入 offset=0, size=0
+  - 游戏读取时找不到文件
+
+v2.1.2 修复:
+  - 区分"真正的 NullEntry"和"0 字节的文件"
+  - 0 字节文件现在正确写入 offset 和 size=0
+
+================================================================================
+八、CustomData 详解
+================================================================================
+
+【8.1 什么是 CustomData？】
+
+CustomData 是属性条目中最后的 4 字节 (uint32_t)，位于 offset 0x2C。
+
+【8.2 CustomData 的用途】
+
+大多数游戏中，CustomData = 文件大小 (与 EntryInfo.size 相同)。
+
+但有些游戏用 CustomData 存储其他信息:
+  - 文件类型标识
+  - 压缩标志
+  - 版本号
+  - 开发者自定义数据
+
+【8.3 AFSLib 如何判断 CustomData 是否包含文件大小？】
+
+属性: AllAttributesContainEntrySize
+
+计算方式:
+  对每个非 NullEntry:
+    如果 dataEntry.CustomData != dataEntry.Size → 返回 false
+  如果全部匹配 → 返回 true
+
+这可以用来判断 CustomData 是否被用作文件大小。
+
+================================================================================
+九、完整的 AFS 创建流程 (从源码推导)
+================================================================================
+
+【9.1 SaveToStream 方法流程】
+
+1. 写入头部
+   - magic (4 bytes)
+   - entryCount (4 bytes)
+
+2. 计算每个文件的偏移
+   - firstEntryOffset = Pad(8 + entryCount*8 + 8, EntryBlockAlignment)
+   - currentOffset = firstEntryOffset
+   - 对每个文件:
+       offsets[i] = currentOffset
+       currentOffset += fileSize
+       currentOffset = Pad(currentOffset, 2048)
+
+3. 写入目录条目
+   - 对每个文件:
+       写入 offset (4 bytes)
+       写入 size (4 bytes)
+
+4. [可选] 写入属性信息
+   - 如果 AttributesInfoType == InfoAtBeginning:
+       在目录后写入 attributesOffset 和 attributesSize
+   - 填充到 firstEntryOffset
+
+5. 写入文件数据
+   - 对每个文件:
+       将流定位到 offsets[i]
+       写入文件数据
+
+6. [可选] 写入属性表
+   - 如果 ContainsAttributes:
+       将流定位到 attributesOffset
+       对每个文件:
+         写入 name[32]
+         写入时间 (6 x uint16)
+         写入 customData (uint32)
+
+7. 尾部填充
+   - 将流定位到当前末尾
+   - 填充到 2048 对齐边界
+   - 设置流长度为 endOfFile
+
+【9.2 关键代码片段】
+
+// 计算第一个文件偏移
+uint firstEntryOffset = Utils.Pad(
+    HEADER_SIZE + (ENTRY_INFO_ELEMENT_SIZE * EntryCount) + ATTRIBUTE_INFO_SIZE, 
+    EntryBlockAlignment
+);
+
+// 计算每个文件偏移
+uint currentEntryOffset = firstEntryOffset;
+for (int e = 0; e < EntryCount; e++) {
+    if (entries[e] is NullEntry) {
+        offsets[e] = 0;
+    } else {
+        offsets[e] = currentEntryOffset;
+        DataEntry dataEntry = entries[e] as DataEntry;
+        currentEntryOffset += dataEntry.Size;
+        currentEntryOffset = Utils.Pad(currentEntryOffset, ALIGNMENT_SIZE);
+    }
+}
+
+// 写入目录
+for (int e = 0; e < EntryCount; e++) {
+    if (entries[e] is NullEntry) {
+        bw.Write((uint)0);  // offset
+        bw.Write((uint)0);  // size
+    } else {
+        DataEntry dataEntry = entries[e] as DataEntry;
+        bw.Write(offsets[e]);
+        bw.Write(dataEntry.Size);
+    }
+}
+
+// 写入文件数据
+for (int e = 0; e < EntryCount; e++) {
+    if (entries[e] is NullEntry) continue;
+
+    outputStream.Position = offsets[e];
+    using (Stream entryStream = entries[e].GetStream()) {
+        entryStream.CopyTo(outputStream);
+    }
+}
+
+================================================================================
+十、常见 AFS 格式变体
+================================================================================
+
+【10.1 标准 AFS (最常见)】
+
+魔数: "AFS\0" (0x00534641)
+属性: InfoAtBeginning
+对齐: 2048
+
+结构:
+  头部 (8)
+  目录 (entryCount * 8)
+  属性信息 (8) ← attributesOffset, attributesSize
+  填充到 2048
+  文件数据 (对齐到 2048)
+  属性表 (entryCount * 48)
+  尾部填充到 2048
+
+────────────────────────────────────────────────────────────────────────────────
+
+【10.2 无属性 AFS】
+
+魔数: "AFS\0" (0x00534641)
+属性: NoAttributes
+对齐: 2048
+
+结构:
+  头部 (8)
+  目录 (entryCount * 8)
+  填充到 2048
+  文件数据 (对齐到 2048)
+  尾部填充到 2048
+
+特点: 没有文件名信息，提取时文件名是 "00000000", "00000001" 等
+
+────────────────────────────────────────────────────────────────────────────────
+
+【10.3 属性在末尾的 AFS】
+
+魔数: "AFS\0" (0x00534641) 或 "AFS " (0x20534641)
+属性: InfoAtEnd
+对齐: 2048 或更大
+
+结构:
+  头部 (8)
+  目录 (entryCount * 8)
+  填充到 2048
+  属性信息 (8) ← 在第一个文件数据前: attributesOffset, attributesSize
+  文件数据 (对齐到 2048)
+  属性表 (entryCount * 48)
+  尾部填充到 2048
+
+────────────────────────────────────────────────────────────────────────────────
+
+【10.4 大对齐 AFS】
+
+某些游戏 (如 Xbox 游戏) 使用更大的对齐值:
+  EntryBlockAlignment = 4096, 8192, 甚至 32768
+
+这通常是因为:
+  - Xbox 的硬盘扇区更大
+  - 需要与内存页大小对齐
+  - 特定的缓存优化
+
+================================================================================
+十一、手动解析 AFS 的步骤
+================================================================================
+
+如果你需要手动解析 AFS 文件，按以下步骤:
+
+1. 读取头部
+   magic = read_u32_le(0x00)
+   entryCount = read_u32_le(0x04)
+
+2. 验证魔数
+   如果 magic != 0x00534641 且 magic != 0x20534641:
+       这不是有效的 AFS 文件
+
+3. 读取目录
+   for i in 0..entryCount-1:
+       offset = read_u32_le(0x08 + i*8)
+       size = read_u32_le(0x08 + i*8 + 4)
+
+       if offset == 0 and size == 0:
+           entry[i] = NullEntry
+       else:
+           entry[i] = DataEntry(offset, size)
+
+4. 计算 EntryBlockAlignment
+   alignment = 2048
+   endInfoBlock = 0x08 + entryCount*8 + 8
+   entryBlockStartOffset = 第一个非 NullEntry 的 offset
+   while (endInfoBlock + alignment < entryBlockStartOffset):
+       alignment *= 2
+
+5. 检测属性信息位置
+   // 尝试 InfoAtBeginning
+   attrOffset = read_u32_le(0x08 + entryCount*8)
+   attrSize = read_u32_le(0x08 + entryCount*8 + 4)
+
+   if IsValid(attrOffset, attrSize):
+       attributesInfoType = InfoAtBeginning
+   else:
+       // 尝试 InfoAtEnd
+       attrOffset = read_u32_le(entryBlockStartOffset - 8)
+       attrSize = read_u32_le(entryBlockStartOffset - 8 + 4)
+
+       if IsValid(attrOffset, attrSize):
+           attributesInfoType = InfoAtEnd
+       else:
+           attributesInfoType = NoAttributes
+
+6. 读取属性 (如果有)
+   if attributesInfoType != NoAttributes:
+       for i in 0..entryCount-1:
+           if entry[i] is NullEntry: continue
+
+           name = read_string(attrOffset + i*48, 32)
+           year = read_u16_le(attrOffset + i*48 + 0x20)
+           month = read_u16_le(attrOffset + i*48 + 0x22)
+           day = read_u16_le(attrOffset + i*48 + 0x24)
+           hour = read_u16_le(attrOffset + i*48 + 0x26)
+           minute = read_u16_le(attrOffset + i*48 + 0x28)
+           second = read_u16_le(attrOffset + i*48 + 0x2A)
+           customData = read_u32_le(attrOffset + i*48 + 0x2C)
+
+7. 提取文件数据
+   for i in 0..entryCount-1:
+       if entry[i] is NullEntry: continue
+
+       data = read_bytes(entry[i].offset, entry[i].size)
+       save_to_file(data, entry[i].name)
+
+================================================================================
+十二、十六进制查看示例
+================================================================================
+
+假设一个包含 2 个文件的 AFS:
+  文件0: "test.txt", 大小 100 字节
+  文件1: "image.png", 大小 500 字节
+
+十六进制布局 (简化，省略填充):
+
+offset 0x0000:  41 46 53 00   ← magic "AFS\0"
+offset 0x0004:  02 00 00 00   ← entryCount = 2
+
+offset 0x0008:  00 08 00 00   ← 文件0 offset = 2048 (0x800)
+offset 0x000C:  64 00 00 00   ← 文件0 size = 100
+offset 0x0010:  00 09 00 00   ← 文件1 offset = 2304 (0x900)
+offset 0x0014:  F4 01 00 00   ← 文件1 size = 500
+
+offset 0x0018:  [属性信息]    ← attributesOffset, attributesSize (InfoAtBeginning)
+
+offset 0x0018-0x07FF:  00 填充到 2048
+
+offset 0x0800:  [文件0数据: 100 字节的 test.txt 内容]
+offset 0x0864-0x08FF:  00 填充到 2048
+
+offset 0x0900:  [文件1数据: 500 字节的 image.png 内容]
+offset 0x0AF4-0x0FFF:  00 填充到 2048
+
+offset 0x1000:  [属性表]
+  0x1000-0x101F:  "test.txt\0" + 填充
+  0x1020-0x102B:  时间数据 (6 x uint16)
+  0x102C-0x102F:  customData = 100
+
+  0x1030-0x104F:  "image.png\0" + 填充
+  0x1050-0x105B:  时间数据
+  0x105C-0x105F:  customData = 500
+
+offset 0x1060-0x17FF:  00 填充到 2048 (文件末尾对齐)
+
+================================================================================
+十三、AFSPacker metadata.json 机制
+================================================================================
+
+【13.1 metadata.json 的结构】
+
+AFSPacker 提取时会在输出目录生成 metadata.json，内容类似:
+
+{
+    "HeaderMagicType": "AFS_00",
+    "AttributesInfoType": "InfoAtBeginning",
+    "EntryBlockAlignment": 2048,
+    "Entries": [
+        {
+            "Name": "FONT_LIB.BIN",
+            "SanitizedName": "FONT_LIB.BIN",
+            "LastWriteTime": "2023-01-01T00:00:00",
+            "CustomData": 12345,
+            "CustomDataContainsSize": true
+        },
+        ...
+    ]
+}
+
+【13.2 metadata.json 的用途】
+
+提取时 (-e):
+1. 读取原始 AFS
+2. 解析 HeaderMagicType, AttributesInfoType, EntryBlockAlignment
+3. 提取文件到目录
+4. 生成 metadata.json 保存格式变体信息
+
+创建时 (-c):
+1. 读取 metadata.json
+2. 恢复 HeaderMagicType, AttributesInfoType, EntryBlockAlignment
+3. 扫描目录中的文件
+4. 创建新的 AFS
+
+【13.3 关键问题】
+
+AFSPacker 的 AddEntriesFromDirectory 使用 Directory.GetFiles() 获取文件列表，
+其返回顺序是未定义的（取决于文件系统内部排序）。
+
+如果 metadata.json 中 Entries 的顺序与 Directory.GetFiles() 返回的顺序不同，
+可能导致文件名和文件数据错位。
