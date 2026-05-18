@@ -53,6 +53,7 @@ class AFS_Header():
         self.entryCount = _dict["entryCount"]
 
         # TODO：要是还想向下兼容原版程序的话，应该再拆分出一个build_data_bin()函数。后同
+        # 目前的设计还是从dict导入后立刻通过numpy构建二进制文件数据，后同
         self.data_bin = np.array(
             (self.magicStr, self.entryCount),
             dtype=self.Struct)
@@ -238,7 +239,7 @@ class Entry():
         return {"IsNull": self.is_null_entry(),
                 "Name": (self.name if (self.name) else "{0:08n}".format(self.fileID)),
                 "FileName": (self.name if (self.name) else "{0:08n}".format(self.fileID)),
-                "Size": self.size,
+                # "Size": self.size,
                 "CustomData": self.customData,
                 "MTime": self.mtime,
                 }
@@ -258,6 +259,10 @@ class Entry():
         inFilePath = inDir / self.name
         self.mtime = time.localtime(inFilePath.stat().st_mtime)
         self.size = inFilePath.stat().st_size
+
+        self.entryInfo_bin["size"] = self.size
+        self.attributeInfo_bin["time"] = np.array(
+            self.mtime[:6], dtype=self.Struct_Time)
 
     def extract_file(self, outDir: Path):
         outFilePath = outDir / (self.name if (self.name)
@@ -349,23 +354,26 @@ class AFS():
         self.header.read_from_bin()
         self.metadata.update(self.header.get_dict())
 
+        # 读头
         if (self.header.magicStr not in self.header._magic):
             raise ValueError("不正确的魔术字：{0:s}".format(self.header.magicStr))
 
         for i in range(self.header.entryCount):
             entry = Entry(self.AFSFile)
-            entry.read_entryinfo_from_bin()
+            entry.read_entryinfo_from_bin()  # 读EntryInfo表
             entry.set_fileID(i)
-            
+
             self.entries.append(entry)
 
-        self.__calc_EntryBlockAlignment_from_bin__()
+        # 这种形式的函数更像C的宏展开
+        self.__calc_EntryBlockAlignment_from_bin__()  # 推算EntryBlockAlignment
 
         self.attributesHeader.bind_AFSFile(self.AFSFile)
-        self.__find_attibutes_header__()
+        self.__find_attibutes_header__()  # 寻找AttributesInfo表的头
 
         self.metadata["Entries"] = []
 
+        # 读AttributesInfo表
         if (self.attributesHeader.headerType != AttributesInfoType.NoAttributes):
             self.AFSFile.seek(self.attributesHeader.attributesOffset, 0)
             for entry in self.entries:
@@ -381,9 +389,9 @@ class AFS():
                 entry.extract_file(self.args.outDir)
 
         match (self.args.mode):
-            case "i":
+            case "i":  # i模式则打印元数据
                 pp.pprint(self.metadata)
-            case "e":
+            case "e":  # e模式则转储元数据至json
                 jsonFile = open(self.jsonFilePath, "wt")
                 json.dump(self.metadata, jsonFile,
                           ensure_ascii=False, indent='\t')
@@ -391,7 +399,7 @@ class AFS():
 
     def __calc_entryBlockStartOffset__(self):
         while (self.header.Struct.itemsize + len(self.entries) * Entry.Struct_EntryInfo.itemsize + self.attributesHeader.Struct.itemsize > self.entryBlockStartOffset):
-            self.entryBlockStartOffset += BlockAlignmentBase
+            self.entryBlockStartOffset += self.EntryBlockAlignment
 
     def __calc_attributes_header_offset__(self):
         match (self.attributesHeader.headerType):
@@ -410,8 +418,8 @@ class AFS():
         self.attributesHeader.attributesSize = 0
         for entry in self.entries:
             if (not entry.isNullEntry):
-                self.attributesHeader.attributesOffset += (entry.size // self.EntryBlockAlignment + (
-                    1 if (entry.size % self.EntryBlockAlignment) else 0)) * self.EntryBlockAlignment
+                self.attributesHeader.attributesOffset += (entry.size // BlockAlignmentBase + (
+                    1 if (entry.size % BlockAlignmentBase) else 0)) * BlockAlignmentBase
 
                 self.attributesHeader.attributesSize += Entry.Struct_AttributeInfo.itemsize
 
@@ -421,8 +429,8 @@ class AFS():
             if (not entry.isNullEntry):
                 entry.AFSOffset = offset
 
-                offset += (entry.size // self.EntryBlockAlignment + (1 if (entry.size %
-                           self.EntryBlockAlignment) else 0)) * self.EntryBlockAlignment
+                offset += (entry.size // BlockAlignmentBase + (1 if (entry.size %
+                           BlockAlignmentBase) else 0)) * BlockAlignmentBase
 
     def write(self):
         jsonFile = open(self.jsonFilePath, "rt")
@@ -431,7 +439,7 @@ class AFS():
 
         self.header.read_from_dict(self.metadata)
 
-        self.attributesHeader=AFS_Attributes_Header()
+        self.attributesHeader = AFS_Attributes_Header()
         self.attributesHeader.read_from_dict(self.metadata)
 
         for entryMetadata in self.metadata["Entries"]:
@@ -441,13 +449,13 @@ class AFS():
             entry.update(self.args.inDir)
             self.entries.append(entry)
 
-        # 计算偏移
-        self.__calc_entryBlockStartOffset__()
+        # 计算偏移，先算好偏移再填数据
+        self.__calc_entryBlockStartOffset__()  # 计算首个非空Entry的起始偏移
         if (self.attributesHeader.headerType != AttributesInfoType.NoAttributes):
-            self.__calc_attributes_header_offset__()
-        self.__calc_attributes_offset__()
+            self.__calc_attributes_header_offset__()  # 计算AttributesInfo表头的位置
+        self.__calc_attributes_offset__()  # 计算AttributesInfo表的起始偏移
 
-        self.__calc_entry_offset__()
+        self.__calc_entry_offset__()  # 计算各Entry文件内容的偏移
 
         # 写文件
         np.zeros(self.entryBlockStartOffset,
@@ -473,16 +481,14 @@ class AFS():
                 self.AFSFile.write(file.read())
                 file.close()
 
-        attributesInfoTable = np.array([entry.get_attribute_info_bin() for entry in self.entries if (
-            not entry.isNullEntry)], dtype=Entry.Struct_AttributeInfo)
         self.AFSFile.seek(self.attributesHeader.attributesOffset, 0)
-        np.zeros(
-                (attributesInfoTable.itemsize // BlockAlignmentBase +
-                 (1 if (attributesInfoTable.itemsize % BlockAlignmentBase) else 0)) * BlockAlignmentBase,
-            dtype=np.uint8).tofile(self.AFSFile)
-
-        self.AFSFile.seek(self.attributesHeader.attributesOffset, 0)
-        attributesInfoTable.tofile(self.AFSFile)
+        np.array([entry.get_attribute_info_bin() for entry in self.entries if (
+            not entry.isNullEntry)], dtype=Entry.Struct_AttributeInfo).tofile(self.AFSFile)
+        currentPos = self.AFSFile.tell()
+        endPos = (currentPos // BlockAlignmentBase + (1 if (currentPos %
+                  BlockAlignmentBase) else 0)) * BlockAlignmentBase
+        print(endPos, currentPos)
+        np.zeros(endPos - currentPos, dtype=np.uint8).tofile(self.AFSFile)
 
     def clear(self):
         if (not self.AFSFile.closed):

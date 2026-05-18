@@ -18,6 +18,11 @@ $ ./AFSPacker.py i [-h] AFSFilePath # 列出
 
 库(`Ubuntu 26.04`系统源内名称)：`python3-numpy`。
 
+## 相较于原版……
+
+1. 修复了`Linux`环境下解`AFS`包后得到元数据文件“名”部分缺失的问题，即只能生成名为`.json`的元数据文件。虽然实际上维持错误的逻辑反而在使用上更方便，但是其逻辑在此版本下不好复刻。
+2. 元数据文件记载的项更多。
+
 ## 附件
 
 `AFS_Format_Specification.txt`：[`KIMI AI`](https://kimi.moonshot.cn/)分析原版代码得出的`CRI AFS`文件结构解析。
