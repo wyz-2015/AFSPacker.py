@@ -481,14 +481,14 @@ class AFS():
                 self.AFSFile.write(file.read())
                 file.close()
 
-        self.AFSFile.seek(self.attributesHeader.attributesOffset, 0)
-        np.array([entry.get_attribute_info_bin() for entry in self.entries if (
-            not entry.isNullEntry)], dtype=Entry.Struct_AttributeInfo).tofile(self.AFSFile)
-        currentPos = self.AFSFile.tell()
-        endPos = (currentPos // BlockAlignmentBase + (1 if (currentPos %
-                  BlockAlignmentBase) else 0)) * BlockAlignmentBase
-        print(endPos, currentPos)
-        np.zeros(endPos - currentPos, dtype=np.uint8).tofile(self.AFSFile)
+        if (self.attributesHeader.headerType != AttributesInfoType.NoAttributes):  # 写属性表
+            self.AFSFile.seek(self.attributesHeader.attributesOffset, 0)
+            np.array([entry.get_attribute_info_bin() for entry in self.entries if (
+                not entry.isNullEntry)], dtype=Entry.Struct_AttributeInfo).tofile(self.AFSFile)
+            currentPos = self.AFSFile.tell()
+            endPos = (currentPos // BlockAlignmentBase + (1 if (currentPos %
+                      BlockAlignmentBase) else 0)) * BlockAlignmentBase
+            np.zeros(endPos - currentPos, dtype=np.uint8).tofile(self.AFSFile)
 
     def clear(self):
         if (not self.AFSFile.closed):
